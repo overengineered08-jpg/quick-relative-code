@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Desmos → Relative G-Code</title>
+<style>
+  :root {
+    --bg:#1a1a1a; --panel:#242424; --accent:#4ade80; --accent2:#60a5fa;
+    --text:#e5e5e5; --muted:#888; --border:#3a3a3a; --warn:#facc15; --bad:#f87171;
+  }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; margin:0; padding:20px; }
+  .wrap { max-width:1040px; margin:0 auto; }
+  h1 { font-size:20px; margin-bottom:4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .layout { display:flex; gap:16px; flex-wrap:wrap; }
+  .col-main { flex:2; min-width:340px; }
+  .col-side { flex:1; min-width:280px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .panel b { font-size:13px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; margin-top:10px; }
+  input, select, textarea.jsonbox { width:100%; background:#1a1a1a; border:1px solid var(--border); color:var(--text); padding:7px; border-radius:6px; font-size:13px; }
+  input[type=file] { padding:5px; font-size:12px; }
+  input[type=range] { padding:0; }
+  button { background:var(--accent); color:#0a0a0a; border:none; padding:9px 14px; border-radius:6px; font-weight:600; cursor:pointer; margin-top:10px; margin-right:6px; font-size:12.5px; }
+  button.secondary { background:transparent; border:1px solid var(--border); color:var(--text); }
+  button.blue { background:var(--accent2); color:#0a0a0a; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #canvasWrap { border:1px solid var(--border); border-radius:8px; overflow:auto; background:#0d0d0d; max-height:600px; }
+  canvas { display:block; max-width:100%; }
+  textarea { width:100%; height:220px; background:#111; color:var(--accent); font-family:'SF Mono',Consolas,monospace; font-size:12px; border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:10px; resize:vertical; }
+  textarea.jsonbox { height:90px; font-family:'SF Mono',Consolas,monospace; font-size:11px; }
+  .status { font-size:12px; color:var(--muted); margin-top:8px; line-height:1.5; white-space:pre-wrap; }
+  .status.ok { color:var(--accent); }
+  .status.warn { color:var(--warn); }
+  .status.bad { color:var(--bad); }
+  .pointrow { display:flex; align-items:center; gap:6px; font-size:12px; padding:4px 0; border-bottom:1px solid var(--border); }
+  .pointlist { max-height:150px; overflow-y:auto; margin-top:8px; }
+  .hint { font-size:11.5px; color:var(--muted); margin-top:8px; line-height:1.5; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  details summary { cursor:pointer; font-size:12px; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Desmos → Relative G-Code</h1>
+  <div class="sub">Paste a Desmos share link. This pulls the image and any coordinate points you placed in the graph, traces the figure's outline, and builds relative (G91) G-code — ready to paste into ncviewer.com.</div>
+
+  <div class="layout">
+    <div class="col-main">
+
+      <div class="panel">
+        <b>1. Load your Desmos graph</b>
+        <label>Desmos share link</label>
+        <input type="text" id="desmosLink" placeholder="https://www.desmos.com/calculator/xxxxxxxxxx">
+        <button onclick="fetchDesmos()">Fetch Graph</button>
+        <button class="secondary" onclick="toggleManual()">Paste JSON manually</button>
+        <div id="manualBox" style="display:none;">
+          <label>Graph JSON (see hint below for how to get this if auto-fetch fails)</label>
+          <textarea class="jsonbox" id="manualJson" placeholder="Paste the graph JSON here"></textarea>
+          <button class="secondary" onclick="useManualJson()">Use This JSON</button>
+        </div>
+        <div class="hint">
+          This page's local server fetches the graph for you — "Fetch Graph" should just work off the link.
+          This box is only a backup for the rare case Desmos itself is unreachable. If needed: open your
+          Desmos link, open the browser console (F12), and run:<br>
+          <code>fetch(location.href,{headers:{Accept:'application/json'}}).then(r=>r.text()).then(t=>copy(t))</code><br>
+          That copies the graph JSON to your clipboard — paste it into the box above.
+        </div>
+        <div class="status" id="fetchStatus"></div>
+      </div>
+
+      <div class="panel">
+        <b>2. Image</b>
+        <div id="imageStatus" class="status">No image loaded yet.</div>
+        <div id="imageFallback" style="display:none;">
+          <label>Couldn't load the image directly (likely a cross-origin restriction) — upload the same image file here instead. The point coordinates and scale you already loaded will still be used.</label>
+          <input type="file" id="imgFallbackInput" accept="image/*">
+        </div>
+      </div>
+
+      <div class="panel">
+        <b>3. Trace the figure</b>
+        <div id="canvasWrap">
+          <canvas id="canvas" width="600" height="400"></canvas>
+        </div>
+        <div class="row">
+          <div>
+            <label>Threshold: <span id="threshVal">128</span></label>
+            <input type="range" id="thresh" min="0" max="255" value="128" oninput="updateThreshLabel(); previewMask();">
+          </div>
+          <div>
+            <label>Invert (trace light shape on dark bg)</label>
+            <input type="checkbox" id="invert" onchange="previewMask()">
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Simplify amount (higher = fewer points)</label>
+            <input type="range" id="epsilon" min="0" max="5" step="0.1" value="1.2">
+          </div>
+          <div>
+            <label>Start point (from your Desmos points)</label>
+            <select id="startPoint"></select>
+          </div>
+        </div>
+        <button class="blue" onclick="traceShape()">Trace Shape</button>
+        <div class="status" id="traceStatus"></div>
+        <div class="hint">Works best when the figure has clear contrast against its background. Adjust threshold/invert until the mask preview cleanly outlines just your shape, then trace.</div>
+      </div>
+    </div>
+
+    <div class="col-side">
+      <div class="panel">
+        <b>Points found in your graph</b>
+        <div class="pointlist" id="pointList">
+          <div class="hint">None yet — fetch a graph first.</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <b>Scale</b>
+        <label>mm per Desmos graph unit</label>
+        <input type="number" id="mmPerUnit" value="10" step="0.1">
+        <div class="hint">Desmos coordinates are unitless. Tell it how many real-world mm equal 1 graph unit (e.g. if your image spans 5 graph units and you want that to be 50mm across, enter 10).</div>
+      </div>
+
+      <div class="panel">
+        <b>Cut settings</b>
+        <label>Cut feed rate (mm/min)</label>
+        <input type="number" id="cutFeed" value="600">
+        <label>Plunge feed rate (mm/min)</label>
+        <input type="number" id="plungeFeed" value="200">
+        <label>Cut depth (mm)</label>
+        <input type="number" id="zDepth" value="2" step="0.1">
+
+        <button onclick="generateGcode()">Generate G-Code</button>
+        <div class="status" id="genStatus"></div>
+        <textarea id="output" readonly placeholder="Relative G-code will appear here..."></textarea>
+        <button class="secondary" onclick="copyOut()">Copy</button>
+        <button class="secondary" onclick="emailOut()">Email It To Yourself</button>
+        <div class="hint">"Email It" opens your own mail app with the G-code in the body (this page can't send mail on its own). For long programs, use Copy instead — mail apps often truncate very long links.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let graphState = null;
+let imageInfo = null;      // { url, centerX, centerY, widthUnits, heightUnits }
+let imgEl = null;           // loaded HTMLImageElement
+let points = [];            // [{x,y,label}] in graph units
+let displayScale = 1;
+let contourGraphPts = null; // traced + simplified contour, in graph units, closed loop
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// ---------- Step 1: fetch / parse Desmos graph ----------
+// This page is served by server.js, which does these fetches server-side.
+// CORS is a browser-only restriction, so a server-to-server request has no
+// such problem — no proxy juggling needed.
+
+function extractHash(url) {
+  const m = url.match(/calculator\/([a-zA-Z0-9]+)/);
+  return m ? m[1] : null;
+}
+
+async function fetchDesmos() {
+  const link = document.getElementById('desmosLink').value.trim();
+  const hash = extractHash(link);
+  const statusEl = document.getElementById('fetchStatus');
+  if (!hash) { statusEl.textContent = 'Could not find a graph ID in that link.'; statusEl.className='status bad'; return; }
+
+  statusEl.textContent = 'Fetching...';
+  statusEl.className = 'status';
+  try {
+    const target = `https://www.desmos.com/calculator/${hash}`;
+    const res = await fetch(`/api/desmos?url=${encodeURIComponent(target)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    loadGraphState(data.state || data);
+    statusEl.textContent = 'Graph loaded.';
+    statusEl.className = 'status ok';
+  } catch (err) {
+    statusEl.textContent = 'Fetch failed (' + err.message + '). Use "Paste JSON manually" below as a backup.';
+    statusEl.className = 'status warn';
+    document.getElementById('manualBox').style.display = 'block';
+  }
+}
+
+function toggleManual() {
+  const box = document.getElementById('manualBox');
+  box.style.display = box.style.display === 'none' ? 'block' : 'none';
+}
+
+function useManualJson() {
+  const statusEl = document.getElementById('fetchStatus');
+  try {
+    const raw = JSON.parse(document.getElementById('manualJson').value);
+    loadGraphState(raw.state || raw);
+    statusEl.textContent = 'Graph loaded from pasted JSON.';
+    statusEl.className = 'status ok';
+  } catch (err) {
+    statusEl.textContent = 'Could not parse that JSON: ' + err.message;
+    statusEl.className = 'status bad';
+  }
+}
+
+function evalCoordPair(latex) {
+  // pulls a plain numeric "(x,y)" pair out of a latex string
+  const m = latex.replace(/\\left|\\right/g, '').match(/\(\s*(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)\s*\)/);
+  if (!m) return null;
+  return { x: parseFloat(m[1]), y: parseFloat(m[2]) };
+}
+
+function loadGraphState(state) {
+  graphState = state;
+  const list = (state.expressions && state.expressions.list) || [];
+
+  // find first image
+  const imgExpr = list.find((e) => e.type === 'image');
+  points = [];
+
+  list.forEach((e) => {
+    if (e.type !== 'expression' || !e.latex) return;
+    const c = evalCoordPair(e.latex);
+    if (c) points.push({ x: c.x, y: c.y, label: e.id || ('pt' + points.length) });
+  });
+
+  renderPointList();
+
+  if (!imgExpr) {
+    document.getElementById('imageStatus').textContent = 'No image found in this graph.';
+    document.getElementById('imageStatus').className = 'status bad';
+    return;
+  }
+
+  const cx = evalCoordPair(imgExpr.center || '(0,0)') || { x: 0, y: 0 };
+  const w = parseFloat(imgExpr.width) || 10;
+  const h = parseFloat(imgExpr.height) || 10;
+  imageInfo = { url: imgExpr.image_url, centerX: cx.x, centerY: cx.y, widthUnits: w, heightUnits: h };
+
+  loadImageElement(imageInfo.url);
+}
+
+function renderPointList() {
+  const container = document.getElementById('pointList');
+  const sel = document.getElementById('startPoint');
+  container.innerHTML = '';
+  sel.innerHTML = '';
+  if (points.length === 0) {
+    container.innerHTML = '<div class="hint">No coordinate points found in this graph\'s expressions.</div>';
+    return;
+  }
+  points.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'pointrow';
+    row.textContent = `${p.label}: (${p.x}, ${p.y})`;
+    container.appendChild(row);
+
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = `${p.label}: (${p.x}, ${p.y})`;
+    sel.appendChild(opt);
+  });
+}
+
+// ---------- Step 2: load the image bitmap ----------
+
+async function loadImageElement(url) {
+  const statusEl = document.getElementById('imageStatus');
+  statusEl.textContent = 'Loading image...';
+  statusEl.className = 'status';
+  try {
+    // Fetched via server.js (same-origin), so the resulting blob URL never
+    // taints the canvas — no CORS workaround needed for pixel reads either.
+    const res = await fetch(`/api/image?url=${encodeURIComponent(url)}`);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      imgEl = img;
+      setupCanvas();
+      statusEl.textContent = `Image loaded (${img.naturalWidth}×${img.naturalHeight}px).`;
+      statusEl.className = 'status ok';
+      document.getElementById('imageFallback').style.display = 'none';
+    };
+    img.onerror = () => showImageFallback('Downloaded the image but the browser could not decode it.');
+    img.src = objectUrl;
+  } catch (err) {
+    showImageFallback('Could not load the image automatically (' + err.message + ').');
+  }
+}
+
+function showImageFallback(msg) {
+  const statusEl = document.getElementById('imageStatus');
+  statusEl.textContent = msg;
+  statusEl.className = 'status warn';
+  document.getElementById('imageFallback').style.display = 'block';
+}
+
+document.getElementById('imgFallbackInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const img = new Image();
+    img.onload = () => {
+      imgEl = img;
+      setupCanvas();
+      document.getElementById('imageStatus').textContent = `Image loaded from upload (${img.naturalWidth}×${img.naturalHeight}px).`;
+      document.getElementById('imageStatus').className = 'status ok';
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+});
+
+function setupCanvas() {
+  const maxW = 900;
+  displayScale = imgEl.naturalWidth > maxW ? maxW / imgEl.naturalWidth : 1;
+  canvas.width = imgEl.naturalWidth * displayScale;
+  canvas.height = imgEl.naturalHeight * displayScale;
+  drawBase();
+}
+
+// ---------- coordinate mapping (graph units <-> canvas pixels) ----------
+
+function graphToCanvasPx(gx, gy) {
+  if (!imageInfo || !imgEl) return { x: gx, y: gy };
+  const { centerX, centerY, widthUnits, heightUnits } = imageInfo;
+  const nx = ((gx - (centerX - widthUnits / 2)) / widthUnits) * imgEl.naturalWidth;
+  const ny = ((centerY + heightUnits / 2 - gy) / heightUnits) * imgEl.naturalHeight;
+  return { x: nx * displayScale, y: ny * displayScale };
+}
+
+function canvasPxToGraph(px, py) {
+  const nx = px / displayScale, ny = py / displayScale;
+  if (!imageInfo || !imgEl) return { x: nx, y: ny };
+  const { centerX, centerY, widthUnits, heightUnits } = imageInfo;
+  const gx = (centerX - widthUnits / 2) + (nx / imgEl.naturalWidth) * widthUnits;
+  const gy = (centerY + heightUnits / 2) - (ny / imgEl.naturalHeight) * heightUnits;
+  return { x: gx, y: gy };
+}
+
+// ---------- drawing ----------
+
+function drawBase() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (imgEl) ctx.drawImage(imgEl, 0, 0, canvas.width, canvas.height);
+  drawPoints();
+  if (contourGraphPts) drawContour();
+}
+
+function drawPoints() {
+  points.forEach((p) => {
+    const { x, y } = graphToCanvasPx(p.x, p.y);
+    ctx.fillStyle = '#60a5fa';
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = '11px monospace';
+    ctx.fillStyle = '#60a5fa';
+    ctx.fillText(p.label, x + 7, y - 7);
+  });
+}
+
+function drawContour() {
+  ctx.strokeStyle = '#4ade80';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  contourGraphPts.forEach((pt, i) => {
+    const c = graphToCanvasPx(pt.x, pt.y);
+    if (i === 0) ctx.moveTo(c.x, c.y); else ctx.lineTo(c.x, c.y);
+  });
+  ctx.closePath();
+  ctx.stroke();
+}
+
+function updateThreshLabel() {
+  document.getElementById('threshVal').textContent = document.getElementById('thresh').value;
+}
+
+function previewMask() {
+  if (!imgEl) return;
+  drawBase();
+  const { mask, w, h } = computeMask();
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (mask[y * w + x]) {
+        const idx = (y * w + x) * 4;
+        imgData.data[idx] = 74; imgData.data[idx+1] = 222; imgData.data[idx+2] = 128; imgData.data[idx+3] = 90;
+      }
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
+// ---------- Step 3: threshold mask + contour trace ----------
+
+function computeMask() {
+  const w = canvas.width, h = canvas.height;
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(imgEl, 0, 0, w, h);
+  const data = tctx.getImageData(0, 0, w, h).data;
+  const threshold = parseInt(document.getElementById('thresh').value, 10);
+  const invert = document.getElementById('invert').checked;
+  const mask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const r = data[i*4], g = data[i*4+1], b = data[i*4+2];
+    const lum = 0.299*r + 0.587*g + 0.114*b;
+    const isForeground = invert ? lum > threshold : lum < threshold;
+    mask[i] = isForeground ? 1 : 0;
+  }
+  return { mask, w, h };
+}
+
+function traceBoundaryFrom(mask, w, h, seedX, seedY) {
+  const idx = (x, y) => y * w + x;
+  // find nearest foreground pixel to the seed
+  let start = null, best = Infinity;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (mask[idx(x, y)]) {
+        const d = (x - seedX) ** 2 + (y - seedY) ** 2;
+        if (d < best) { best = d; start = [x, y]; }
+      }
+    }
+  }
+  if (!start) return null;
+
+  const neighbors = [[1,0],[1,-1],[0,-1],[-1,-1],[-1,0],[-1,1],[0,1],[1,1]];
+  const boundary = [start];
+  let b = start;
+  let backtrack = [start[0] - 1, start[1]];
+  let count = 0;
+  const maxSteps = w * h * 4;
+
+  do {
+    const dBx = backtrack[0] - b[0], dBy = backtrack[1] - b[1];
+    let startIdx = neighbors.findIndex(([dx, dy]) => dx === dBx && dy === dBy);
+    if (startIdx === -1) startIdx = 0;
+    let found = false;
+    for (let i = 1; i <= 8; i++) {
+      const ni = (startIdx + i) % 8;
+      const [dx, dy] = neighbors[ni];
+      const nx = b[0] + dx, ny = b[1] + dy;
+      if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[idx(nx, ny)]) {
+        const pdir = neighbors[(startIdx + i - 1 + 8) % 8];
+        backtrack = [b[0] + pdir[0], b[1] + pdir[1]];
+        b = [nx, ny];
+        found = true;
+        break;
+      }
+    }
+    if (!found) break;
+    boundary.push(b);
+    count++;
+  } while (!(b[0] === start[0] && b[1] === start[1]) && count < maxSteps);
+
+  return boundary;
+}
+
+function perpendicularDistance(p, a, b) {
+  const [x, y] = p, [x1, y1] = a, [x2, y2] = b;
+  const num = Math.abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1);
+  const den = Math.hypot(y2 - y1, x2 - x1) || 1e-9;
+  return num / den;
+}
+
+function simplifyDP(pts, epsilon) {
+  if (pts.length < 3) return pts;
+  let dmax = 0, index = 0;
+  const a = pts[0], b = pts[pts.length - 1];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d = perpendicularDistance(pts[i], a, b);
+    if (d > dmax) { dmax = d; index = i; }
+  }
+  if (dmax > epsilon) {
+    const left = simplifyDP(pts.slice(0, index + 1), epsilon);
+    const right = simplifyDP(pts.slice(index), epsilon);
+    return left.slice(0, -1).concat(right);
+  }
+  return [a, b];
+}
+
+function traceShape() {
+  const statusEl = document.getElementById('traceStatus');
+  if (!imgEl) { statusEl.textContent = 'Load an image first.'; statusEl.className = 'status bad'; return; }
+
+  const { mask, w, h } = computeMask();
+
+  let seedX = w / 2, seedY = h / 2;
+  const startSel = document.getElementById('startPoint');
+  if (points.length > 0 && startSel.value !== '') {
+    const p = points[parseInt(startSel.value, 10)];
+    const c = graphToCanvasPx(p.x, p.y);
+    seedX = c.x; seedY = c.y;
+  }
+
+  const raw = traceBoundaryFrom(mask, w, h, seedX, seedY);
+  if (!raw || raw.length < 4) {
+    statusEl.textContent = 'No clear shape found — adjust the threshold/invert settings until the green mask preview outlines just your figure, then try again.';
+    statusEl.className = 'status bad';
+    return;
+  }
+
+  const open = raw.slice(0, -1); // drop duplicate closing point before simplifying
+  const epsilon = parseFloat(document.getElementById('epsilon').value) * displayScale;
+  const simplified = simplifyDP(open, epsilon);
+
+  contourGraphPts = simplified.map(([x, y]) => canvasPxToGraph(x, y));
+  contourGraphPts.push(contourGraphPts[0]); // re-close the loop
+
+  drawBase();
+  statusEl.textContent = `Traced outline with ${contourGraphPts.length - 1} points.`;
+  statusEl.className = 'status ok';
+}
+
+// ---------- Step 4: relative G-code ----------
+
+function generateGcode() {
+  const genStatus = document.getElementById('genStatus');
+  if (!contourGraphPts) {
+    genStatus.textContent = 'Trace the shape first.';
+    genStatus.className = 'status bad';
+    return;
+  }
+  const mmPerUnit = parseFloat(document.getElementById('mmPerUnit').value) || 1;
+  const cutFeed = parseFloat(document.getElementById('cutFeed').value) || 600;
+  const plungeFeed = parseFloat(document.getElementById('plungeFeed').value) || 200;
+  const zDepth = parseFloat(document.getElementById('zDepth').value) || 2;
+
+  const lines = [
+    'G91 ; relative positioning',
+    'G21 ; units in millimeters',
+    `; ${mmPerUnit}mm per Desmos graph unit`,
+    ''
+  ];
+
+  lines.push(`; start at first traced point (treated as origin)`);
+  lines.push(`G1 Z-${zDepth} F${plungeFeed} ; plunge`);
+
+  for (let i = 1; i < contourGraphPts.length; i++) {
+    const dx = (contourGraphPts[i].x - contourGraphPts[i-1].x) * mmPerUnit;
+    const dy = (contourGraphPts[i].y - contourGraphPts[i-1].y) * mmPerUnit;
+    lines.push(`G1 X${dx.toFixed(3)} Y${dy.toFixed(3)} F${cutFeed}`);
+  }
+
+  lines.push(`G0 Z${zDepth} ; retract`);
+  lines.push('M2 ; program end');
+
+  document.getElementById('output').value = lines.join('\n');
+  genStatus.textContent = 'Done.';
+  genStatus.className = 'status ok';
+}
+
+function copyOut() {
+  const out = document.getElementById('output');
+  out.select();
+  document.execCommand('copy');
+}
+
+function emailOut() {
+  const code = document.getElementById('output').value;
+  if (!code) { alert('Generate the G-code first.'); return; }
+  const subject = encodeURIComponent('Your relative G-code');
+  const body = encodeURIComponent(code);
+  window.location.href = `mailto:?subject=${subject}&body=${body}`;
+}
+</script>
+</body>
+</html>
